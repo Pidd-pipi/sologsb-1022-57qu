@@ -11,6 +11,11 @@ import type {
 
 const FIXED_TIME = '2026-09-25T02:00:00.000Z';
 let tokenSequence = 0;
+let stableSequence = 0;
+
+function stableId(prefix: string) {
+  return `${prefix}-stable-${(stableSequence += 1).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 function canUseSegmenter() {
   return typeof Intl !== 'undefined' && 'Segmenter' in Intl;
@@ -106,7 +111,9 @@ const pengId = findTokenId('sentence-1-3', '鹏');
 const mingId = findTokenId('sentence-1-1', '北冥');
 const bianId = findTokenId('sentence-3-2', '辩');
 
-const annotations: Annotation[] = [
+type SeedAnnotation = Omit<Annotation, 'stableId' | 'adjudicationState' | 'anchorState' | 'repairState'>;
+
+const annotations: Annotation[] = ([
   {
     id: 'annotation-1',
     anchorId: chapters[0].sentences[0].id,
@@ -233,7 +240,13 @@ const annotations: Annotation[] = [
     conflictState: 'open',
     updatedAt: FIXED_TIME
   }
-];
+] as SeedAnnotation[]).map((annotation) => ({
+  ...annotation,
+  stableId: stableId('annotation'),
+  adjudicationState: 'accepted' as const,
+  anchorState: 'ok' as const,
+  repairState: 'ok' as const
+}));
 
 const initialSnapshot: VersionSnapshot = {
   id: 'snapshot-base',

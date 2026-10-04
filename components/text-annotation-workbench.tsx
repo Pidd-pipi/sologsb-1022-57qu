@@ -25,33 +25,44 @@ import {
   CircleHelp,
   FileDown,
   FileJson,
+  FileUp,
   GitCompareArrows,
   Keyboard,
   Link2,
+  Link2Off,
   ListTree,
   Pencil,
   Plus,
   Printer,
   Redo2,
+  RotateCcw,
   Save,
   Search,
   Trash2,
   Undo2,
   Wifi,
-  WifiOff
+  WifiOff,
+  X
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { annotationKindLabels, anchorTypeLabels, initialDocument, tokenizeText } from '@/lib/data';
 import {
   STORAGE_KEY,
+  buildMergeItems,
   clone,
   collectSearchResults,
   createInitialEditorState,
+  createStableId,
+  draftToPackage,
   editorReducer,
+  exportPackage,
   getConflictGroups,
   getSentence,
   getTargetLabel,
+  isAdjudicated,
   kindLabel,
+  migrateDocument,
+  parsePackageFile,
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
@@ -60,11 +71,13 @@ import type {
   AnnotationKind,
   AnchorType,
   ConflictGroup,
+  MergeCheckpoint,
   Sentence,
   TextDocument,
   ViewMode,
   WorkspaceState
 } from '@/lib/types';
+import { MergePanel } from './merge-panel';
 
 const MODE_COPY: Record<ViewMode, { label: string; hint: string }> = {
   reading: { label: '阅读版', hint: '只读正文，脚注按引用编号展开' },
@@ -104,7 +117,10 @@ function buildHtml(document: TextDocument) {
       const sentences = chapter.sentences
         .map((sentence) => {
           const notes = document.annotations.filter(
-            (annotation) => annotation.anchorId === sentence.id && annotation.anchorType === 'sentence'
+            (annotation) =>
+              isAdjudicated(annotation) &&
+              annotation.anchorId === sentence.id &&
+              annotation.anchorType === 'sentence'
           );
           const suffix = notes
             .map((annotation) => `<sup title="${escapeHtml(annotation.title)}">[${escapeHtml(annotation.source)}]</sup>`)
@@ -117,6 +133,7 @@ function buildHtml(document: TextDocument) {
     .join('\n');
 
   const notes = document.annotations
+    .filter((annotation) => isAdjudicated(annotation))
     .map(
       (annotation) =>
         `<li><b>${escapeHtml(annotation.title)}</b> <span>${escapeHtml(annotation.source)}</span><br>${escapeHtml(annotation.body)}</li>`
@@ -132,8 +149,9 @@ ${sections}<hr><h2>注释与校记</h2><ol>${notes}</ol><p><small>导出时间�
 function sentenceAnnotationCount(document: TextDocument, sentence: Sentence) {
   return document.annotations.filter(
     (annotation) =>
-      annotation.anchorId === sentence.id ||
-      sentence.tokens.some((token) => token.id === annotation.anchorId)
+      isAdjudicated(annotation) &&
+      (annotation.anchorId === sentence.id ||
+        sentence.tokens.some((token) => token.id === annotation.anchorId))
   ).length;
 }
 
@@ -162,8 +180,13 @@ interface AnnotationFormProps {
   anchorId: string;
   anchorType: AnchorType;
   anchorPreview: string;
-  onSubmit: (values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) => void;
+  onSubmit: (values: AnnotationFormValues) => void;
 }
+
+type AnnotationFormValues = Omit<
+  Annotation,
+  'id' | 'status' | 'conflictState' | 'updatedAt' | 'stableId' | 'adjudicationState' | 'anchorState' | 'repairState'
+>;
 
 function AnnotationForm({ anchorId, anchorType, anchorPreview, onSubmit }: AnnotationFormProps) {
   const [kind, setKind] = useState<AnnotationKind>('footnote');
@@ -279,6 +302,9 @@ function AnnotationCard({ annotation, document, selected, onSelect, onUpdate, on
                   {kindLabel(annotation.kind)}
                 </Chip>
                 {annotation.conflictState === 'open' ? <Chip size="sm" color="danger" variant="bordered">争议中</Chip> : null}
+                {annotation.anchorState === 'stale' ? <Chip size="sm" color="warning" variant="flat">锚点失效</Chip> : null}
+                {annotation.repairState === 'broken' ? <Chip size="sm" color="danger" variant="flat">待修</Chip> : null}
+                {annotation.adjudicationState === 'pending' ? <Chip size="sm" variant="flat">未裁定</Chip> : null}
               </div>
               <h4 className="mt-2 font-semibold text-stone-900">{annotation.title}</h4>
             </div>
@@ -340,6 +366,8 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -349,6 +377,16 @@ export function TextAnnotationWorkbench() {
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
   const conflicts = useMemo(() => getConflictGroups(document), [document]);
   const searchResults = useMemo(() => collectSearchResults(document, workspace.query), [document, workspace.query]);
+  const staleAnnotations = useMemo(
+    () => document.annotations.filter((annotation) => annotation.anchorState === 'stale'),
+    [document.annotations]
+  );
+  const brokenAnnotations = useMemo(
+    () => document.annotations.filter((annotation) => annotation.repairState === 'broken'),
+    [document.annotations]
+  );
+  const pendingConfirmCount = staleAnnotations.length + brokenAnnotations.length;
+  const checkpoint = workspace.mergeCheckpoint;
 
   const anchor = pendingAnchor ?? {
     id: selectedSentence?.id ?? selectedChapter?.id ?? '',
@@ -364,8 +402,14 @@ export function TextAnnotationWorkbench() {
       if (raw) {
         const stored = JSON.parse(raw) as WorkspaceState;
         if (stored.document?.chapters?.length) {
-          dispatch({ type: 'hydrate', workspace: stored });
-          if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
+          const migrated = migrateDocument(stored.document);
+          if ('error' in migrated) {
+            setApiMessage(`离线草稿无法升级：${migrated.error}`);
+          } else {
+            dispatch({ type: 'hydrate', workspace: { ...stored, document: migrated.document, mergeCheckpoint: stored.mergeCheckpoint ?? null } });
+            if (migrated.document.snapshots[0]) setLeftVersionId(migrated.document.snapshots[0].id);
+            if (stored.mergeCheckpoint?.status === 'staging') setMergeOpen(true);
+          }
         }
       }
     } catch {
@@ -404,9 +448,10 @@ export function TextAnnotationWorkbench() {
   }, [selectedChapter?.id, selectedSentence?.id]);
 
   const moveToNextAnnotation = useCallback(() => {
-    if (!document.annotations.length) return;
-    const currentIndex = document.annotations.findIndex((item) => item.id === workspace.selectedAnnotationId);
-    const next = document.annotations[(currentIndex + 1) % document.annotations.length];
+    const visible = document.annotations.filter((annotation) => isAdjudicated(annotation));
+    if (!visible.length) return;
+    const currentIndex = visible.findIndex((item) => item.id === workspace.selectedAnnotationId);
+    const next = visible[(currentIndex + 1) % visible.length];
     dispatch({ type: 'selectAnnotation', annotationId: next.id });
     for (const chapter of document.chapters) {
       const sentence = chapter.sentences.find((item) => item.id === next.anchorId);
@@ -444,9 +489,10 @@ export function TextAnnotationWorkbench() {
       } else if (event.key.toLowerCase() === 'j') {
         moveToNextAnnotation();
       } else if (event.key.toLowerCase() === 'k') {
-        if (!document.annotations.length) return;
-        const currentIndex = document.annotations.findIndex((item) => item.id === workspace.selectedAnnotationId);
-        const previous = document.annotations[(currentIndex - 1 + document.annotations.length) % document.annotations.length];
+        const visible = document.annotations.filter((annotation) => isAdjudicated(annotation));
+        if (!visible.length) return;
+        const currentIndex = visible.findIndex((item) => item.id === workspace.selectedAnnotationId);
+        const previous = visible[(currentIndex - 1 + visible.length) % visible.length];
         dispatch({ type: 'selectAnnotation', annotationId: previous.id });
       } else if (event.altKey && ['1', '2', '3'].includes(event.key)) {
         const mode = ({ '1': 'reading', '2': 'editing', '3': 'critical' } as const)[event.key as '1' | '2' | '3'];
@@ -471,7 +517,7 @@ export function TextAnnotationWorkbench() {
     setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
   }
 
-  function addAnnotation(values: Omit<Annotation, 'id' | 'status' | 'conflictState' | 'updatedAt'>) {
+  function addAnnotation(values: AnnotationFormValues) {
     const id = `annotation-${Date.now().toString(36)}`;
     dispatch({
       type: 'commit',
@@ -482,6 +528,10 @@ export function TextAnnotationWorkbench() {
           id,
           status: 'open',
           conflictState: 'open',
+          stableId: createStableId(),
+          adjudicationState: 'accepted',
+          anchorState: 'ok',
+          repairState: 'ok',
           updatedAt: new Date().toISOString()
         });
       }
@@ -535,16 +585,16 @@ export function TextAnnotationWorkbench() {
 
   function applySentenceEdit() {
     if (!editingSentenceId || !editingSentenceDraft.trim()) return;
-    let remapped = 0;
+    let stale = 0;
     dispatch({
       type: 'commit',
-      label: '修订句子并保持引用稳定',
+      label: '修订句子并标记失效锚点',
       mutate: (doc) => {
-        remapped = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
+        stale = updateSentenceText(doc, editingSentenceId, editingSentenceDraft.trim(), tokenizeText);
       }
     });
     setEditingSentenceId(null);
-    if (remapped) setApiMessage(`已修订句子；${remapped} 条词级引用自动迁移到所属句`);
+    if (stale) setApiMessage(`已修订句子；${stale} 条注释的正文锚点失效，已转入「待确认」，未硬接到其他句子`);
   }
 
   function saveVersion() {
@@ -617,11 +667,47 @@ export function TextAnnotationWorkbench() {
   }, [document, leftVersionId, rightVersionId]);
 
   function exportJson() {
-    download(`${document.title}.json`, JSON.stringify(document, null, 2), 'application/json;charset=utf-8');
+    const exportDoc: TextDocument = {
+      ...document,
+      annotations: document.annotations.filter((annotation) => isAdjudicated(annotation))
+    };
+    download(`${document.title}.json`, JSON.stringify(exportDoc, null, 2), 'application/json;charset=utf-8');
   }
 
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
+  }
+
+  async function handlePackageFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const text = await file.text();
+    const result = parsePackageFile(text);
+    if (result.kind === 'error') {
+      dispatch({ type: 'mergeFail', fileName: file.name, error: result.error });
+      setMergeOpen(true);
+      return;
+    }
+    const pkg = result.kind === 'draft' ? draftToPackage(result.document, file.name) : result.pkg;
+    const items = buildMergeItems(document, pkg);
+    dispatch({ type: 'mergeStage', fileName: file.name, pkg, items });
+    setMergeOpen(true);
+  }
+
+  function handleExportPackage() {
+    const pkg = exportPackage(document, '本地校注员');
+    download(
+      `${document.title}.批注包.json`,
+      JSON.stringify(pkg, null, 2),
+      'application/json;charset=utf-8'
+    );
+    setApiMessage(`已导出批注包：仅包含 ${pkg.annotations.length} 条已裁定意见，未裁定意见不进入导出`);
+  }
+
+  function reanchorToCurrent(annotationId: string, anchorId: string, anchorType: AnchorType) {
+    dispatch({ type: 'reanchorAnnotation', id: annotationId, anchorId, anchorType });
+    setApiMessage('已重新锚定，引用关系恢复稳定');
   }
 
   const mode = workspace.mode;
@@ -673,11 +759,24 @@ export function TextAnnotationWorkbench() {
                 <Redo2 className="h-4 w-4" />
               </Button>
             </Tooltip>
+            <Tooltip content="导入批注包或旧版草稿">
+              <Button size="sm" variant="flat" startContent={<FileUp className="h-4 w-4" />} onPress={() => fileInputRef.current?.click()}>
+                导入批注包
+              </Button>
+            </Tooltip>
             <Tooltip content="保存到模拟接口 ⌘/Ctrl + S">
               <Button size="sm" color="primary" startContent={<Save className="h-4 w-4" />} onPress={() => void persistSnapshot('手动保存')}>
                 保存
               </Button>
             </Tooltip>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              aria-label="导入批注包文件"
+              onChange={handlePackageFile}
+            />
           </div>
         </div>
         <div className="mx-auto flex max-w-[1800px] items-center gap-2 px-4 pb-2 text-xs text-stone-500 lg:px-6">
@@ -804,8 +903,9 @@ export function TextAnnotationWorkbench() {
                 {selectedChapter?.sentences.map((sentence) => {
                   const sentenceAnnotations = document.annotations.filter(
                     (annotation) =>
-                      annotation.anchorId === sentence.id ||
-                      sentence.tokens.some((token) => token.id === annotation.anchorId)
+                      isAdjudicated(annotation) &&
+                      (annotation.anchorId === sentence.id ||
+                        sentence.tokens.some((token) => token.id === annotation.anchorId))
                   );
                   const active = selectedSentence?.id === sentence.id;
                   return (
@@ -839,7 +939,9 @@ export function TextAnnotationWorkbench() {
                           ) : (
                             <p className="font-serif text-xl leading-[2.1] text-stone-850">
                               {sentence.tokens.map((token) => {
-                                const tokenAnnotations = document.annotations.filter((annotation) => annotation.anchorId === token.id);
+                                const tokenAnnotations = document.annotations.filter(
+                                  (annotation) => isAdjudicated(annotation) && annotation.anchorId === token.id
+                                );
                                 if (!token.text.trim()) return <span key={token.id}>{token.text}</span>;
                                 return (
                                   <button
@@ -968,8 +1070,7 @@ export function TextAnnotationWorkbench() {
                   </ScrollShadow>
                 </Tab>
 
-                <Tab key="conflicts" title={`冲突 ${conflicts.length}`}>
-                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                <Tab key="conflicts" title={`冲突 ${conflicts.length}`}>                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
                     <div className="space-y-4 pr-1">
                       <div className="rounded-xl bg-red-50 p-3 text-xs leading-5 text-red-800">
                         系统按“相同引用目标 + 相同注释类型”识别来源冲突。可逐条保留、合并或标记解决，正文引用 ID 不变。
@@ -1005,6 +1106,109 @@ export function TextAnnotationWorkbench() {
                           <Check className="h-8 w-8 text-green-600" />
                           <p className="mt-2 text-sm font-medium text-green-800">所有来源冲突均已解决</p>
                           <p className="mt-1 text-xs text-green-700">已解决记录仍保留在各注释的来源字段中。</p>
+                        </div>
+                      ) : null}
+                    </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="pending" title={`待确认 ${pendingConfirmCount}`}>
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <div className="space-y-4 pr-1">
+                      <div className="rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-800">
+                        正文改动后旧锚点上的注释立即失效待确认，不遮住底本、不硬接到别的句子。可重新锚定到当前选中的句子或词语，也可驳回；未裁定的意见不进入校勘版和导出。
+                      </div>
+
+                      {staleAnnotations.length ? (
+                        <div className="space-y-2">
+                          <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-stone-500">
+                            <AlertTriangle className="h-3.5 w-3.5" />锚点失效（{staleAnnotations.length}）
+                          </h3>
+                          {staleAnnotations.map((annotation) => (
+                            <Card key={annotation.id} shadow="none" className="border border-amber-200 bg-amber-50/50">
+                              <CardBody className="gap-2 p-3">
+                                <div className="flex items-center gap-2">
+                                  <Chip size="sm" color="warning" variant="flat">{kindLabel(annotation.kind)}</Chip>
+                                  <span className="truncate text-sm font-semibold text-stone-900">{annotation.title}</span>
+                                </div>
+                                {annotation.anchorMismatch ? (
+                                  <div className="rounded-lg bg-white/70 p-2 text-[11px] leading-4 text-stone-600">
+                                    <p>旧文：{annotation.anchorMismatch.expectedText || '（原锚点）'}</p>
+                                    <p className="mt-0.5">新文：{annotation.anchorMismatch.actualText || '（已不存在）'}</p>
+                                  </div>
+                                ) : null}
+                                <div className="flex flex-wrap gap-1.5">
+                                  <Button
+                                    size="sm"
+                                    color="primary"
+                                    variant="flat"
+                                    startContent={<RotateCcw className="h-3 w-3" />}
+                                    onPress={() => reanchorToCurrent(annotation.id, anchor.id, anchor.type)}
+                                  >
+                                    锚定到当前{anchorTypeLabels[anchor.type]}
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    color="danger"
+                                    variant="light"
+                                    startContent={<X className="h-3 w-3" />}
+                                    onPress={() => deleteAnnotation(annotation.id)}
+                                  >
+                                    驳回
+                                  </Button>
+                                </div>
+                              </CardBody>
+                            </Card>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {brokenAnnotations.length ? (
+                        <div className="space-y-2">
+                          <h3 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-stone-500">
+                            <Link2Off className="h-3.5 w-3.5" />跨引用待修（{brokenAnnotations.length}）
+                          </h3>
+                          {brokenAnnotations.map((annotation) => (
+                            <Card key={annotation.id} shadow="none" className="border border-red-200 bg-red-50/50">
+                              <CardBody className="gap-2 p-3">
+                                <div className="flex items-center gap-2">
+                                  <Chip size="sm" color="danger" variant="flat">{kindLabel(annotation.kind)}</Chip>
+                                  <span className="truncate text-sm font-semibold text-stone-900">{annotation.title}</span>
+                                </div>
+                                <p className="text-[11px] leading-4 text-stone-600">
+                                  断开的引用：{annotation.references.join('、')}
+                                </p>
+                                <div className="flex flex-wrap gap-1.5">
+                                  <Button
+                                    size="sm"
+                                    color="primary"
+                                    variant="flat"
+                                    startContent={<Link2Off className="h-3 w-3" />}
+                                    onPress={() => dispatch({ type: 'repairAnnotation', id: annotation.id })}
+                                  >
+                                    移除断开引用
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    color="danger"
+                                    variant="light"
+                                    startContent={<X className="h-3 w-3" />}
+                                    onPress={() => deleteAnnotation(annotation.id)}
+                                  >
+                                    驳回
+                                  </Button>
+                                </div>
+                              </CardBody>
+                            </Card>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {!pendingConfirmCount ? (
+                        <div className="grid place-items-center rounded-xl border border-dashed border-green-200 bg-green-50 p-8 text-center">
+                          <Check className="h-8 w-8 text-green-600" />
+                          <p className="mt-2 text-sm font-medium text-green-800">没有待确认的意见</p>
+                          <p className="mt-1 text-xs text-green-700">锚点失效或跨引用断开时会集中显示在这里。</p>
                         </div>
                       ) : null}
                     </div>
@@ -1074,9 +1278,10 @@ export function TextAnnotationWorkbench() {
                       </div>
 
                       <Divider />
-                      <div className="grid grid-cols-2 gap-2">
+                      <div className="grid grid-cols-3 gap-2">
                         <Button size="sm" variant="flat" onPress={exportHtml} startContent={<FileDown className="h-4 w-4" />}>导出 HTML</Button>
                         <Button size="sm" variant="flat" onPress={exportJson} startContent={<FileJson className="h-4 w-4" />}>导出 JSON</Button>
+                        <Button size="sm" variant="flat" onPress={handleExportPackage} startContent={<FileUp className="h-4 w-4" />}>批注包</Button>
                       </div>
                       <p className="text-[11px] leading-5 text-stone-500">{apiMessage}</p>
                     </div>
@@ -1091,6 +1296,24 @@ export function TextAnnotationWorkbench() {
       <footer className="mx-auto max-w-[1800px] px-6 pb-8 text-center text-xs text-stone-400">
         数据保存在当前浏览器；清除站点数据会同时删除离线草稿与版本快照。
       </footer>
+
+      {mergeOpen && checkpoint ? (
+        <MergePanel
+          checkpoint={checkpoint}
+          onClose={() => setMergeOpen(false)}
+          onDecide={(key, decision) => dispatch({ type: 'mergeDecide', key, decision })}
+          onDecideAll={(decision) => dispatch({ type: 'mergeDecideAll', decision })}
+          onCommit={() => {
+            dispatch({ type: 'mergeCommit' });
+            setApiMessage('批注包合并完成，已认领意见进入校勘版与导出');
+          }}
+          onDiscard={() => {
+            dispatch({ type: 'mergeDiscard' });
+            setMergeOpen(false);
+            setApiMessage('已放弃批注包检查点，原草稿保留不变');
+          }}
+        />
+      ) : null}
     </div>
   );
 }
