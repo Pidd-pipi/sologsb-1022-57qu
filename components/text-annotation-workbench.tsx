@@ -52,14 +52,24 @@ import {
   getSentence,
   getTargetLabel,
   kindLabel,
+  normalizeWorkspace,
   removeAnnotationReferences,
   updateSentenceText
 } from '@/lib/editor';
+import {
+  decideMergeItem,
+  parseAnnotationPackage,
+  prepareMergeSession,
+  retargetMergeItem,
+  sessionCounts
+} from '@/lib/merge';
+import { MergePanel } from '@/components/merge-panel';
 import type {
+  AnchorType,
   Annotation,
   AnnotationKind,
-  AnchorType,
   ConflictGroup,
+  MergeDecision,
   Sentence,
   TextDocument,
   ViewMode,
@@ -340,6 +350,7 @@ export function TextAnnotationWorkbench() {
   const [rightVersionId, setRightVersionId] = useState('current');
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [apiMessage, setApiMessage] = useState('模拟接口待命');
+  const [mergeFeedback, setMergeFeedback] = useState('');
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const workspace = state.workspace;
@@ -349,6 +360,7 @@ export function TextAnnotationWorkbench() {
   const selectedSentence = getSentence(document, workspace.selectedSentenceId);
   const conflicts = useMemo(() => getConflictGroups(document), [document]);
   const searchResults = useMemo(() => collectSearchResults(document, workspace.query), [document, workspace.query]);
+  const mergeCounts = useMemo(() => sessionCounts(workspace.mergeSession), [workspace.mergeSession]);
 
   const anchor = pendingAnchor ?? {
     id: selectedSentence?.id ?? selectedChapter?.id ?? '',
@@ -362,10 +374,14 @@ export function TextAnnotationWorkbench() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const stored = JSON.parse(raw) as WorkspaceState;
+        const stored = normalizeWorkspace(JSON.parse(raw) as WorkspaceState);
         if (stored.document?.chapters?.length) {
           dispatch({ type: 'hydrate', workspace: stored });
           if (stored.document.snapshots[0]) setLeftVersionId(stored.document.snapshots[0].id);
+          if (stored.mergeSession) {
+            setRightTab('merge');
+            setApiMessage('已恢复进行中的合并会话，可继续逐条认领');
+          }
         }
       }
     } catch {
@@ -622,6 +638,80 @@ export function TextAnnotationWorkbench() {
 
   function exportHtml() {
     download(`${document.title}.html`, buildHtml(document), 'text/html;charset=utf-8');
+  }
+
+  function importPackageText(text: string) {
+    const { pkg, error } = parseAnnotationPackage(text, document);
+    if (error || !pkg) {
+      setMergeFeedback(error ?? '批注包无法解析。');
+      setRightTab('merge');
+      return;
+    }
+    if (pkg.documentId && pkg.documentId !== document.id) {
+      setMergeFeedback(`警告：该批注包基准书稿为「${pkg.documentId}」，与当前书稿「${document.id}」不同，仍可人工核对锚点后认领。`);
+    }
+    const prepared = prepareMergeSession(document, pkg, new Date().toISOString());
+    dispatch({ type: 'mergeImport', session: prepared.session });
+    const counts = sessionCounts(prepared.session);
+    setMergeFeedback(
+      `已读入 ${pkg.author} 的 ${counts.total} 条意见：失效 ${counts.stale}、缺失 ${counts.missing}、重复 ${counts.duplicate}、断链 ${counts.brokenRefs}；合并前检查点已留存。`
+    );
+    setRightTab('merge');
+  }
+
+  function decideItem(localOriginId: string, decision: MergeDecision) {
+    if (!workspace.mergeSession || decision === 'pending') return;
+    dispatch({ type: 'mergeSetSession', session: decideMergeItem(workspace.mergeSession, localOriginId, decision) });
+  }
+
+  function retargetItem(localOriginId: string, anchorId: string, anchorType: AnchorType) {
+    if (!workspace.mergeSession) return;
+    dispatch({
+      type: 'mergeSetSession',
+      session: retargetMergeItem(document, workspace.mergeSession, localOriginId, anchorId, anchorType)
+    });
+    setApiMessage('失效锚点已按人工确认改挂，不会遮挡底本');
+  }
+
+  function applyMerge() {
+    if (!workspace.mergeSession) return;
+    if (mergeCounts.pending > 0) {
+      setMergeFeedback(`还有 ${mergeCounts.pending} 条意见未裁定，未裁定意见不进入校勘版与导出。`);
+      return;
+    }
+    dispatch({ type: 'mergeApply', reportLabel: '合并完成' });
+    const broken = mergeCounts.brokenRefs;
+    setMergeFeedback(broken ? `合并完成，另有 ${broken} 条断开引用，请在断链待修区处理。` : '合并完成，认领意见已进入校勘版。');
+    setApiMessage('合并完成；合并前检查点保留在版本中，可随时对照');
+  }
+
+  function cancelMerge() {
+    if (!window.confirm('关闭合并会话？合并前检查点仍保留在“版本”中，可恢复原草稿。')) return;
+    dispatch({ type: 'mergeCancel' });
+  }
+
+  function restoreMergeCheckpoint() {
+    if (!workspace.mergeSession) return;
+    if (!window.confirm('按合并前检查点恢复底本与原注释？当前会话保留，可重开后继续处理。')) return;
+    dispatch({ type: 'mergeRestoreCheckpoint' });
+    setApiMessage('已恢复合并前草稿，原合并会话保留待续审');
+  }
+
+  function repairBrokenReference(annotationId: string, originId: string, targetAnnotationId: string | null) {
+    dispatch({
+      type: 'commit',
+      label: targetAnnotationId ? '改指断开的交叉引用' : '移除断开的交叉引用',
+      mutate: (doc) => {
+        const annotation = doc.annotations.find((item) => item.id === annotationId);
+        if (!annotation) return;
+        annotation.brokenReferences = (annotation.brokenReferences ?? []).filter((item) => item !== originId);
+        annotation.tags = annotation.tags.filter((tag) => tag !== '断链待修');
+        if (targetAnnotationId && !annotation.references.includes(targetAnnotationId)) {
+          annotation.references.push(targetAnnotationId);
+        }
+        annotation.updatedAt = new Date().toISOString();
+      }
+    });
   }
 
   const mode = workspace.mode;
@@ -1008,6 +1098,23 @@ export function TextAnnotationWorkbench() {
                         </div>
                       ) : null}
                     </div>
+                  </ScrollShadow>
+                </Tab>
+
+                <Tab key="merge" title={`合并${mergeCounts.pending ? ` ${mergeCounts.pending}` : ''}`}>
+                  <ScrollShadow className="max-h-[calc(100vh-210px)]">
+                    <MergePanel
+                      document={document}
+                      session={workspace.mergeSession}
+                      feedback={mergeFeedback}
+                      onImportText={importPackageText}
+                      onDecide={decideItem}
+                      onRetarget={retargetItem}
+                      onApply={applyMerge}
+                      onCancel={cancelMerge}
+                      onRestoreCheckpoint={restoreMergeCheckpoint}
+                      onRepairBroken={repairBrokenReference}
+                    />
                   </ScrollShadow>
                 </Tab>
 

@@ -1,18 +1,36 @@
 import type {
+  AnchorType,
   Annotation,
   AnnotationKind,
   ConflictGroup,
   EditorState,
+  MergeSession,
   SearchResult,
   Sentence,
   TextDocument,
   WorkspaceState
 } from './types';
+import { applyMergeSession } from './merge';
 
 export const STORAGE_KEY = 'sologsb-1022/public-text-annotator/v1';
 
 export function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+/** 旧版本地草稿（无 mergeSession 字段）升级为当前工作区结构。 */
+export function normalizeWorkspace(raw: WorkspaceState): WorkspaceState {
+  return {
+    ...raw,
+    document: raw.document,
+    mode: raw.mode ?? 'reading',
+    selectedChapterId: raw.selectedChapterId ?? raw.document?.chapters?.[0]?.id ?? '',
+    selectedSentenceId: raw.selectedSentenceId ?? raw.document?.chapters?.[0]?.sentences?.[0]?.id ?? '',
+    selectedAnnotationId: raw.selectedAnnotationId ?? null,
+    query: raw.query ?? '',
+    dirty: raw.dirty ?? false,
+    mergeSession: raw.mergeSession ?? null
+  };
 }
 
 export function createInitialWorkspace(document: TextDocument): WorkspaceState {
@@ -23,7 +41,8 @@ export function createInitialWorkspace(document: TextDocument): WorkspaceState {
     selectedSentenceId: document.chapters[0]?.sentences[0]?.id ?? '',
     selectedAnnotationId: null,
     query: '',
-    dirty: false
+    dirty: false,
+    mergeSession: null
   };
 }
 
@@ -53,6 +72,11 @@ export type EditorAction =
   | { type: 'selectAnnotation'; annotationId: string | null }
   | { type: 'setMode'; mode: WorkspaceState['mode'] }
   | { type: 'setQuery'; query: string }
+  | { type: 'mergeImport'; session: MergeSession }
+  | { type: 'mergeSetSession'; session: MergeSession }
+  | { type: 'mergeApply'; reportLabel: string }
+  | { type: 'mergeCancel' }
+  | { type: 'mergeRestoreCheckpoint' }
   | { type: 'undo' }
   | { type: 'redo' };
 
@@ -71,6 +95,61 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       next.document.updatedAt = new Date().toISOString();
       next.dirty = true;
       return pushHistory(state, next, action.label);
+    }
+    case 'mergeImport': {
+      const next = clone(state.workspace);
+      const session = action.session;
+      const checkpoint = next.document.snapshots.find((item) => item.id === session.checkpointId);
+      if (!checkpoint) {
+        next.document.snapshots.push({
+          id: session.checkpointId,
+          label: `合并前检查点 · ${session.author}`,
+          note: `导入 ${session.author} 离线批注包前自动留存，合并失败可回到此稿。`,
+          createdAt: session.createdAt,
+          chapters: clone(next.document.chapters),
+          annotations: clone(next.document.annotations)
+        });
+      }
+      next.mergeSession = clone(session);
+      next.dirty = true;
+      return pushHistory(state, next, '导入离线批注包，生成合并检查点');
+    }
+    case 'mergeSetSession': {
+      const next = clone(state.workspace);
+      next.mergeSession = clone(action.session);
+      next.dirty = true;
+      return pushHistory(state, next, '认领 / 改挂合并条目');
+    }
+    case 'mergeApply': {
+      const session = state.workspace.mergeSession;
+      if (!session) return state;
+      if (session.items.some((item) => item.decision === 'pending')) return state;
+      const next = clone(state.workspace);
+      const report = applyMergeSession(next.document, clone(session), new Date().toISOString());
+      next.mergeSession = null;
+      next.dirty = true;
+      return pushHistory(
+        state,
+        next,
+        `${action.reportLabel}：认领 ${report.accepted.length} 条，弃 ${report.rejected.length} 条，去重 ${report.duplicates} 条，断链 ${report.brokenRefs} 条`
+      );
+    }
+    case 'mergeCancel': {
+      const next = clone(state.workspace);
+      next.mergeSession = null;
+      next.dirty = true;
+      return pushHistory(state, next, '关闭合并会话（检查点已保留）');
+    }
+    case 'mergeRestoreCheckpoint': {
+      const session = state.workspace.mergeSession;
+      const checkpointId = session?.checkpointId;
+      const next = clone(state.workspace);
+      const checkpoint = next.document.snapshots.find((item) => item.id === checkpointId);
+      if (!checkpoint) return state;
+      next.document.chapters = clone(checkpoint.chapters);
+      next.document.annotations = clone(checkpoint.annotations);
+      next.dirty = true;
+      return pushHistory(state, next, '按检查点恢复合并前草稿，原会话保留待续审');
     }
     case 'selectChapter': {
       const chapter = state.workspace.document.chapters.find((item) => item.id === action.chapterId);
@@ -306,6 +385,7 @@ export function toWorkspace(document: TextDocument, fallback: WorkspaceState): W
     selectedSentenceId: sentence?.id ?? '',
     selectedAnnotationId: fallback.selectedAnnotationId,
     query: fallback.query,
-    dirty: false
+    dirty: false,
+    mergeSession: fallback.mergeSession ?? null
   };
 }
